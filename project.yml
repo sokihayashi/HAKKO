@@ -1,0 +1,41 @@
+name: HAKKO
+options:
+  bundleIdPrefix: com.sokihayashi
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1"
+
+targets:
+  HAKKO:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sokihayashi.HAKKO
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Sources/Info.plist
+        ENABLE_PREVIEWS: YES
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: HAKKO
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: "HAKKOはCCD風の発光写真を撮影するためにカメラを使用します。"
+        NSPhotoLibraryAddUsageDescription: "撮影した写真を保存するためにフォトライブラリへ追加します。"

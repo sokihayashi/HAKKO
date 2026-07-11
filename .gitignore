@@ -1,4 +1,8 @@
 # Xcode
+## XcodeGen生成物（project.ymlから再生成するのでコミットしない）
+*.xcodeproj
+Sources/Info.plist
+
 ## User settings
 xcuserdata/
 *.xcuserstate
