@@ -1,0 +1,60 @@
+# Xcode
+## User settings
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+## Build generated
+build/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+## Various settings
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Obj-C/Swift specific
+*.hmap
+
+## App packaging
+*.app
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods (使わない想定だが念のため)
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Editor
+.vscode/
+.idea/
+*.swp
