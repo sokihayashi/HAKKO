@@ -4,6 +4,10 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+  developmentLanguage: ja
+  # 日本メインのアプリ。基準言語=日本語。English/Baseの.lprojはまだ作らない（UIに翻訳対象テキストがほぼ無い・仕様§4）。
+  knownRegions:
+    - ja
 
 settings:
   base:
@@ -30,6 +34,7 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
+        CFBundleDevelopmentRegion: ja
         CFBundleDisplayName: HAKKO
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
