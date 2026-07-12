@@ -117,3 +117,13 @@
 実機ログ分析で、torch contでも散発する50〜200msのmeterスパイクが「各バーストの1〜2枚目」に集中と判明。原因は teardownで .continuousAuto に戻し→次のstartBurstで再 .locked する **locked↔continuousAuto の往復**で、バースト境界に再収束時間が乗っていた。しかも .locked を入れても跳ねは残った(効果薄・副作用大)。
 → **AE/WB/AF の .locked を全撤去**。torch常時点灯下では継続オートのままで露出は安定し、被写体変化にも追従する(連写→動画化の前提で被写体固定は不適。§8.7)。デバイス設定はtorch点灯のみ。
 - 発熱スパイク(meter=258〜267 msの群)対策で maxBurst 12→8 に減。torch連続点灯の時間を短くしてスロットルを避ける。isTorchActiveで点灯失敗も検出ログ。
+
+### 8.9 【決着】ガタつきの真因=継続オートAEの再測光。custom-locked(露出固定)で解消
+一次調査(AVFoundation/Apple公式フォーラム/実測記事)＋実機A/Bでガタつき問題が決着。
+- **真因**: torch常時点灯は実際に明るさを変えるので継続オートAEが反応し再測光する。これが meter に数百ms(実測471〜535ms)の群スパイクとして乗る。「大きく動かしながら撮る」と画面輝度が変わり多発=実機体感と機序が一致。
+- **対策=露出完全固定(setExposureModeCustom)**: 露出/ISO/WB/AFを.locked/customで固定するとAE再測光が起きず meter が2〜5ms一定に。実機で auto+ZSL(スパイク大量)vs custom-locked(スパイク激減・体感スムーズ)を確認して決着。
+- **-11800(前回の失敗)の回避**: isExposureModeSupported(.custom)確認→exposureDuration/isoをactiveFormatのmin/max範囲にclamp(範囲外が主因)→lockForConfiguration内で設定→ZSLはcustomと排他なので無効化。この正しい手順で-11800は出なくなった。
+- **トレードオフ**: custom-lockedは露出固定=明るさ追従しない(CCD/写ルンです的でむしろ狙いに合う)。ZSLは無効化される。
+- **残課題**: custom-lockedでも稀に134〜361msの跳ね(AF再収束/1枚目の露出未確定)。→AFレンズ位置固定・custom確定のcompletion待ちで詰められる。ただし画のA/B判断手段(サムネ表示)を先に用意してから最終決定する。
+- **err=-17281/-12710は無害と確定**(Apple DTS明言・iOS26系でログ露出)。実害なし。動画方式を将来足す時のみ単一AVCaptureSession共有を守る(複数セッションが同カメラを奪うとFigエラー/競合)。
+- 実装: ExposureMode(autoZSL/customLocked)の2モードA/BをUI切替で残置。決定後に1本化。

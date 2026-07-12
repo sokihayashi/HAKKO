@@ -13,13 +13,33 @@ import UIKit
 ///
 /// 操作モデル: 1回押したら maxBurst まで自動連射（指離しで止めない＝連打/離し判定のバグ源を排除）。
 /// 撮った画像はメモリ配列に保持（将来これを合体して動画GIF/mp4化する予定・加工/保存はStage2以降）。
+/// 露出モードのA/B（meterスパイクの原因＝継続オートAEの再測光を消せるか実機で比較）。
+/// リサーチ確定: torch常時点灯は明るさを変えAEを刺激→再測光の数百msスパイクを生む。
+/// customLockedで露出を完全固定すればスパイクが消える（ただしZSLはcustom露出と排他で無効化）。
+enum ExposureMode: CaseIterable {
+    /// 継続オート＋ZSL有効（現状）。被写体変化に追従するがtorch由来のAE再測光スパイクが出る。
+    case autoZSL
+    /// 露出/ISO/WB/AFをバースト間も完全固定（setExposureModeCustom）。スパイクを消す。ZSLは無効化。
+    case customLocked
+
+    var label: String {
+        switch self {
+        case .autoZSL: return "EXP: auto+ZSL"
+        case .customLocked: return "EXP: custom-locked"
+        }
+    }
+}
+
 final class CameraController: NSObject, ObservableObject {
     // MARK: - チューニング定数（宋其が調整）
 
-    /// 連写バーストの最大枚数。動画化の素材数を兼ねつつ、torch発熱スロットル(実測でmeterスパイク)を避け8。
+    /// 連写バーストの最大枚数。動画化の素材数を兼ねつつ、torch発熱スロットルを避け8。
     static let maxBurst = 8
-    /// torchの明るさ（0.0–1.0 or maxAvailableTorchLevel）。発光の強さ。実機で詰める。
+    /// torchの明るさ（0.0–1.0）。発光の強さ。実機で詰める。
     static let torchLevel: Float = 1.0
+
+    /// 露出モード（デバッグA/B）。UIから循環切替。
+    @Published var exposureMode: ExposureMode = .autoZSL
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.sokihayashi.HAKKO.sessionQueue")
@@ -31,6 +51,8 @@ final class CameraController: NSObject, ObservableObject {
     private var videoDevice: AVCaptureDevice?
     /// バースト用のデバイス設定(torch/ロック)を適用したか。teardown成功時のみ下ろす（後始末取りこぼし防止）。
     private var burstSetupApplied = false
+    /// バースト開始時にexposureModeを固定（途中でモードが変わっても現バーストは一貫）。
+    private var activeExposureMode: ExposureMode = .autoZSL
 
     /// 撮影済み画像（メモリ保持のみ）。UIへはsessionQueue上の内部配列のスナップショットを反映する。
     @Published private(set) var capturedImages: [UIImage] = []
@@ -72,11 +94,26 @@ final class CameraController: NSObject, ObservableObject {
     func stop() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            self.endBurst() // torch点きっぱなし/ロック残りを防ぐ
+            // session停止で torch/custom露出/ZSL は物理的にリセットされる。stop経路では beginConfiguration を
+            // 伴うteardown（ZSL再有効化）を走らせず、torch消灯だけ軽く行ってから停止する（構成変更の交差回避）。
+            self.turnTorchOffOnly()
+            self.isBursting = false
             self.shotInFlight = false      // session停止で飛行中delegateが来ない可能性に備え自己完結
             self.burstSetupApplied = false // session停止でデバイス状態はリセットされる。フラグも揃える。
             guard self.session.isRunning else { return }
             self.session.stopRunning()
+        }
+    }
+
+    /// torchだけ消す（stop経路用・session構成変更を伴わない軽い後始末）。sessionQueue上。
+    private func turnTorchOffOnly() {
+        guard let device = videoDevice, device.hasTorch, device.torchMode != .off else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.torchMode = .off
+        } catch {
+            print("[HAKKO] stop torch off failed: \(error)")
         }
     }
 
@@ -120,12 +157,8 @@ final class CameraController: NSObject, ObservableObject {
         session.addOutput(photoOutput)
         photoOutput.maxPhotoQualityPrioritization = .speed
 
-        // torch＋flashMode=.off なので ZSL/responsive/fast を有効化して連写を最速化（iOS17+）。
-        if #available(iOS 17.0, *) {
-            if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = true }
-            if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = true }
-            if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = true }
-        }
+        // ZSL/responsive/fastは初期有効（autoZSLモード想定）。customLockedバースト時はcustom露出と排他なので無効化する。
+        applyZSL(enabled: true)
 
         print("[HAKKO] supportedFlashModes on=\(photoOutput.supportedFlashModes.contains(.on)) hasTorch=\(device.hasTorch)")
 
@@ -133,20 +166,42 @@ final class CameraController: NSObject, ObservableObject {
         return true
     }
 
+    /// ZSL/responsiveCapture/fastCapturePrioritizationの有効/無効を切り替える（session構成変更・iOS17+）。
+    /// custom露出はZSLと排他なので、customLockedバースト時は無効化する。依存: responsiveはZSL必須、fastはresponsive必須。
+    private func applyZSL(enabled: Bool) {
+        guard #available(iOS 17.0, *) else { return }
+        if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = enabled }
+        if photoOutput.isResponsiveCaptureSupported {
+            photoOutput.isResponsiveCaptureEnabled = enabled && photoOutput.isZeroShutterLagEnabled
+        }
+        if photoOutput.isFastCapturePrioritizationSupported {
+            photoOutput.isFastCapturePrioritizationEnabled = enabled && photoOutput.isResponsiveCaptureEnabled
+        }
+    }
+
     // MARK: - 連写バースト（torch常時点灯・自動連射・仕様書 §2・§3・§4）
 
-    /// シャッターを押したら maxBurst まで自動連射（指離しでは止めない）。
+    /// 露出モードを循環切替（デバッグA/B）。UI(main)から呼ぶ。
+    func cycleExposureMode() {
+        let all = ExposureMode.allCases
+        guard let idx = all.firstIndex(of: exposureMode) else { return }
+        exposureMode = all[(idx + 1) % all.count]
+    }
+
+    /// シャッターを押したら maxBurst まで自動連射（指離しでは止めない）。UI(main)からexposureModeを読む。
     func startBurst() {
+        let mode = exposureMode
         sessionQueue.async { [weak self] in
             guard let self, self.isConfigured, !self.isBursting else { return }
             self.burstGeneration &+= 1        // 世代を進める（遅れて着弾する前バースト完了を弾く）
             self.isBursting = true
             self.burstCount = 0
             self.shotInFlight = false
+            self.activeExposureMode = mode     // 現バーストのモードを固定
             self.images.removeAll()
             self.publishImages()
             self.haptics.prewarmBurstPlayer() // 触覚をwillCaptureで即発火できるよう先に用意
-            self.applyBurstDeviceSetup()      // torch点灯 + AE/WB/AFロック（開始時1回・撮影中は触らない）
+            self.applyBurstDeviceSetup()      // torch点灯 + (customLockedなら)露出固定（開始時1回・撮影中は触らない）
             self.fireNextShotIfNeeded()
         }
     }
@@ -160,36 +215,77 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     /// バースト開始時のデバイス設定（sessionQueue上で1回だけ・撮影中は触らない＝-11830回避）。
-    /// torch常時点灯のみ。AE/WB/AFの.lockedは撤去した — 実機で locked↔continuousAuto の往復が
-    /// バースト境界に50〜130msの再収束スパイクを生み、しかもロックしても跳ねは残った（効果薄・副作用大）。
-    /// torch常時点灯下では継続オートのままでも露出は安定し、被写体変化への追従も保てる（動画化前提）。
+    /// torch点灯は両モード共通。customLockedのみ露出/ISO/WB/AFを固定してAE再測光のmeterスパイクを消す。
+    /// ※setTorchModeOn直後のisTorchActiveチェックは点灯のハード非同期遅延で誤検出するため行わない
+    ///   （リサーチ確定・真の失敗はthrowで捕まる）。
     private func applyBurstDeviceSetup() {
         guard let device = videoDevice, device.hasTorch, device.isTorchModeSupported(.on) else { return }
+
+        // customLockedはZSL(custom露出と排他)を無効化してから固定する。session構成変更はlockとは別経路。
+        if activeExposureMode == .customLocked {
+            session.beginConfiguration()
+            applyZSL(enabled: false)
+            session.commitConfiguration()
+        }
+
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             try device.setTorchModeOn(level: Self.torchLevel)
-            // 発熱スロットリング等で点かない場合の検出（"光ったつもりで光ってない"事故）。
-            if !device.isTorchActive {
-                print("[HAKKO] torch requested but not active (thermal throttling?)")
+
+            if activeExposureMode == .customLocked {
+                // WB/AFを先に固定（露出のcompletion待ちの間も変動させない）。
+                if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
+                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+                // 露出を現在値でcustom固定。activeFormatの範囲にクランプ（範囲外は-11800/例外の主因）。
+                if device.isExposureModeSupported(.custom) {
+                    let fmt = device.activeFormat
+                    let dur = clampTime(device.exposureDuration, fmt.minExposureDuration, fmt.maxExposureDuration)
+                    let iso = min(max(device.iso, fmt.minISO), fmt.maxISO)
+                    device.setExposureModeCustom(duration: dur, iso: iso, completionHandler: nil)
+                } else {
+                    print("[HAKKO] custom exposure not supported; falling back to auto")
+                }
             }
             burstSetupApplied = true
         } catch {
-            print("[HAKKO] burst torch on failed: \(error)")
+            print("[HAKKO] burst device setup failed: \(error)")
         }
     }
 
-    /// バースト終了時の後始末（sessionQueue上）。torch消灯のみ。成功時のみフラグを下ろす。
+    /// バースト終了時の後始末（sessionQueue上）。torch消灯＋(customLockedなら)露出/WB/AFを継続オートへ戻す。
+    /// 成功時のみフラグを下ろす。custom無効化したZSLも再有効化。
     private func teardownBurstDeviceSetup() {
         guard let device = videoDevice else { burstSetupApplied = false; return }
+        let wasCustom = activeExposureMode == .customLocked
+        var restored = false
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             if device.hasTorch, device.torchMode != .off { device.torchMode = .off }
+            if wasCustom {
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+                if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            }
+            restored = true
             burstSetupApplied = false
         } catch {
-            print("[HAKKO] burst torch off failed: \(error)")
+            print("[HAKKO] burst device teardown failed: \(error)") // フラグは下ろさず次回再試行
         }
+        // ZSL再有効化はexposure復帰が成功した場合のみ。失敗時はcustom露出が残っており、ZSLと排他違反になる。
+        if wasCustom && restored {
+            session.beginConfiguration()
+            applyZSL(enabled: true)
+            session.commitConfiguration()
+        }
+    }
+
+    /// CMTimeを[lo, hi]にクランプ（露出時間をactiveFormatの範囲に収める）。
+    private func clampTime(_ v: CMTime, _ lo: CMTime, _ hi: CMTime) -> CMTime {
+        if CMTimeCompare(v, lo) < 0 { return lo }
+        if CMTimeCompare(v, hi) > 0 { return hi }
+        return v
     }
 
     /// 内部配列のスナップショットをmainの@Publishedへ反映（sessionQueue上で呼ぶ）。
@@ -270,11 +366,11 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             if self.inFlightWillCaptureTime > 0 {
                 let meterMs = (self.inFlightWillCaptureTime - self.inFlightFireTime) * 1000
                 let captureMs = (done - self.inFlightWillCaptureTime) * 1000
-                print(String(format: "[HAKKO][measure] flashFired=%@ meter=%.0fms capture=%.0fms total=%.0fms",
-                             flashFired ? "YES" : "no", meterMs, captureMs, totalMs))
+                print(String(format: "[HAKKO][measure] mode=%@ meter=%.0fms capture=%.0fms total=%.0fms",
+                             self.activeExposureMode.label, meterMs, captureMs, totalMs))
             } else {
-                print(String(format: "[HAKKO][measure] flashFired=%@ (no willCapture) total=%.0fms",
-                             flashFired ? "YES" : "no", totalMs))
+                print(String(format: "[HAKKO][measure] mode=%@ (no willCapture) total=%.0fms",
+                             self.activeExposureMode.label, totalMs))
             }
 
             let generation = self.inFlightGeneration

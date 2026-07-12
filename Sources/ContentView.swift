@@ -18,6 +18,18 @@ struct ContentView: View {
                     .background(.black.opacity(0.4), in: Capsule())
                     .padding(.top, 12)
 
+                // デバッグA/B: 露出モード（タップで循環切替）。meterスパイクが消えるか比較。
+                Button(action: { camera.cycleExposureMode() }) {
+                    Text(camera.exposureMode.label)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.black.opacity(0.4), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 6)
+
                 Spacer()
                 // 1回押したら maxBurst まで自動連射（指離しでは止めない）。
                 ShutterButton { camera.startBurst() }
