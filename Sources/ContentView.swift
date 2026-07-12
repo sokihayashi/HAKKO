@@ -19,11 +19,9 @@ struct ContentView: View {
                     .padding(.top, 12)
 
                 Spacer()
-                ShutterButton(
-                    onPressStart: { camera.startBurst() },
-                    onPressEnd: { camera.stopBurst() }
-                )
-                .padding(.bottom, 40)
+                // 1回押したら maxBurst まで自動連射（指離しでは止めない）。
+                ShutterButton { camera.startBurst() }
+                    .padding(.bottom, 40)
             }
         }
         .background(Color.black)
@@ -32,10 +30,9 @@ struct ContentView: View {
     }
 }
 
-/// 丸いシャッターボタン。長押しで連写バースト（押下で開始・離すで停止）。
+/// 丸いシャッターボタン。押すと連写バーストが発動し、maxBurstまで自動で撃ち切る。
 private struct ShutterButton: View {
-    let onPressStart: () -> Void
-    let onPressEnd: () -> Void
+    let onTrigger: () -> Void
 
     @State private var isPressed = false
 
@@ -50,18 +47,15 @@ private struct ShutterButton: View {
                 .scaleEffect(isPressed ? 0.88 : 1.0)
                 .animation(.easeOut(duration: 0.08), value: isPressed)
         }
-        // minimumDistance: 0 で「触れた瞬間＝押下開始」を取る。指を離すと onEnded。
+        // 押下でトリガ（離しは連射に影響しない）。押下フィードバックのみジェスチャで取る。
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { _ in
                     guard !isPressed else { return }
                     isPressed = true
-                    onPressStart()
+                    onTrigger()
                 }
-                .onEnded { _ in
-                    isPressed = false
-                    onPressEnd()
-                }
+                .onEnded { _ in isPressed = false }
         )
     }
 }

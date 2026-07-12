@@ -1,21 +1,25 @@
 import AVFoundation
 import UIKit
 
-/// Stage 1: 背面カメラのライブプレビュー＋本物フラッシュ連写バースト。
+/// Stage 1: 背面カメラのライブプレビュー＋torch常時点灯の高速連写バースト。
 ///
-/// 設計方針（実機A/B検証を経た確定事項・デザインメモ§8）:
-/// - 発光は必ず物理フラッシュ（flashMode=.on）。実光がシーンに当たる＝HAKKOの堀。後処理やトーチでは
-///   照射範囲・falloff・背景の落ちを捏造できない。トーチ手動ストロボはlock競合で撮影が壊れる(-11830)ため破棄。
-/// - 速さは追わない。フラッシュの実サイクル（測光＋発光＋処理）に合わせ、撮影完了を待ってから次を撃つ直列。
-///   コマ間の測光/充電待ちは"チャージ"の体感として肯定する（疾走感でなく一発感・仕様書§2 待ち=リズム）。
-/// - 触覚(.hapticTransient)は willCapturePhoto（＝実発光の瞬間）で鳴らす。測光にどれだけかかっても触覚は
-///   必ずフラッシュと同時に来る＝「音より先に光る」を根本解決。
-/// 撮った画像はメモリ上の配列に保持するのみ（加工/保存は Stage 2 以降）。
+/// 発光方式の確定（実機A/B検証・デザインメモ§8）:
+/// - torch(連続LED光)＋flashMode=.off。写真フラッシュ(.on)はプリフラッシュ測光が構造的に必須で600〜1700ms、
+///   AEロックでも迂回不能。iPhoneのフラッシュもLED連続光で凍結効果は無くtorchと本質同じ。torch方式なら
+///   プリ測光ゼロで meter=2〜5ms（実測）。torchは開始時に1回だけlockForConfigurationし撮影中は触らない＝-11830回避。
+/// - 散発する再収束(50〜200ms)を抑えるため、開始時に AE/WB/AF を .locked（既存値保持。setExposureModeCustomは
+///   -11800で不安定だったため使わない）。
+/// - 触覚(.hapticTransient)は willCapturePhoto（＝実発光の瞬間）で鳴らして発光と同期。
+///
+/// 操作モデル: 1回押したら maxBurst まで自動連射（指離しで止めない＝連打/離し判定のバグ源を排除）。
+/// 撮った画像はメモリ配列に保持（将来これを合体して動画GIF/mp4化する予定・加工/保存はStage2以降）。
 final class CameraController: NSObject, ObservableObject {
     // MARK: - チューニング定数（宋其が調整）
 
-    /// 連写バーストの最大枚数。本物フラッシュのサイクルに合わせ小さめ（初期4〜5）。
-    static let maxBurst = 5
+    /// 連写バーストの最大枚数。動画化の素材数も兼ねるので多め（初期12）。
+    static let maxBurst = 12
+    /// torchの明るさ（0.0–1.0 or maxAvailableTorchLevel）。発光の強さ。実機で詰める。
+    static let torchLevel: Float = 1.0
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.sokihayashi.HAKKO.sessionQueue")
@@ -23,6 +27,10 @@ final class CameraController: NSObject, ObservableObject {
     /// 触覚エンジンはsessionQueueを共有して全アクセスを直列化する（CoreHapticsハンドラとのデータレース回避）。
     private lazy var haptics = HapticEngine(queue: sessionQueue)
     private var isConfigured = false
+    /// torch/ロック操作のため撮影デバイスを保持（sessionQueue上で触る）。
+    private var videoDevice: AVCaptureDevice?
+    /// バースト用のデバイス設定(torch/ロック)を適用したか。teardown成功時のみ下ろす（後始末取りこぼし防止）。
+    private var burstSetupApplied = false
 
     /// 撮影済み画像（メモリ保持のみ）。UIへはsessionQueue上の内部配列のスナップショットを反映する。
     @Published private(set) var capturedImages: [UIImage] = []
@@ -38,7 +46,7 @@ final class CameraController: NSObject, ObservableObject {
     /// sessionQueue上でのみ触る実体。mainへはこれをスナップショットして流す（main.async順序非保証を回避）。
     private var images: [UIImage] = []
 
-    // デバッグ計測: 撮影発火→露出確定(測光/充電) と 露出確定→処理完了(撮影/保存) の内訳。
+    // デバッグ計測: 撮影発火→露出確定 と 露出確定→処理完了 の内訳。
     private var inFlightFireTime: TimeInterval = 0
     private var inFlightWillCaptureTime: TimeInterval = 0
 
@@ -64,7 +72,9 @@ final class CameraController: NSObject, ObservableObject {
     func stop() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            self.isBursting = false
+            self.endBurst() // torch点きっぱなし/ロック残りを防ぐ
+            self.shotInFlight = false      // session停止で飛行中delegateが来ない可能性に備え自己完結
+            self.burstSetupApplied = false // session停止でデバイス状態はリセットされる。フラグも揃える。
             guard self.session.isRunning else { return }
             self.session.stopRunning()
         }
@@ -74,7 +84,10 @@ final class CameraController: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             if !self.isConfigured {
-                self.configureSession()
+                guard self.configureSession() else {
+                    print("[HAKKO] session configuration failed; not starting")
+                    return
+                }
                 self.isConfigured = true
             }
             if !self.session.isRunning {
@@ -83,37 +96,46 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    private func configureSession() {
+    /// セッション構成。成否を返す（失敗時はisConfiguredを立てない）。
+    private func configureSession() -> Bool {
         session.beginConfiguration()
         session.sessionPreset = .photo
 
-        // デザインメモ §4: 物理カメラを明示指定（広角単体）。仮想デバイスの自動融合・自動レンズ切替を避け、
-        // CCD素材として制御しやすい単眼の画にする。
+        // デザインメモ §4: 物理カメラを明示指定（広角単体）。仮想デバイスの自動融合・自動レンズ切替を避ける。
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else {
             print("[HAKKO] failed to configure back camera input")
             session.commitConfiguration()
-            return
+            return false
         }
         session.addInput(input)
+        videoDevice = device
 
         guard session.canAddOutput(photoOutput) else {
             print("[HAKKO] failed to add photo output")
             session.commitConfiguration()
-            return
+            return false
         }
         session.addOutput(photoOutput)
-
-        // デザインメモ §4: 仮想デバイス融合を避ける（広角単眼なので実質no-opだが撮影設定側で明示）。
         photoOutput.maxPhotoQualityPrioritization = .speed
 
+        // torch＋flashMode=.off なので ZSL/responsive/fast を有効化して連写を最速化（iOS17+）。
+        if #available(iOS 17.0, *) {
+            if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = true }
+            if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = true }
+            if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = true }
+        }
+
+        print("[HAKKO] supportedFlashModes on=\(photoOutput.supportedFlashModes.contains(.on)) hasTorch=\(device.hasTorch)")
+
         session.commitConfiguration()
+        return true
     }
 
-    // MARK: - 連写バースト（本物フラッシュ・仕様書 §2・§3・§4）
+    // MARK: - 連写バースト（torch常時点灯・自動連射・仕様書 §2・§3・§4）
 
-    /// シャッター長押し開始で連写バーストを開始。
+    /// シャッターを押したら maxBurst まで自動連射（指離しでは止めない）。
     func startBurst() {
         sessionQueue.async { [weak self] in
             guard let self, self.isConfigured, !self.isBursting else { return }
@@ -124,14 +146,62 @@ final class CameraController: NSObject, ObservableObject {
             self.images.removeAll()
             self.publishImages()
             self.haptics.prewarmBurstPlayer() // 触覚をwillCaptureで即発火できるよう先に用意
+            self.applyBurstDeviceSetup()      // torch点灯 + AE/WB/AFロック（開始時1回・撮影中は触らない）
             self.fireNextShotIfNeeded()
         }
     }
 
-    /// 指を離す/撃ち切りで連写を止める。
-    func stopBurst() {
-        sessionQueue.async { [weak self] in
-            self?.isBursting = false
+    /// バーストを終了状態にしてデバイス設定を後始末する（撃ち切り/stopの経路から・冪等）。
+    private func endBurst() {
+        isBursting = false
+        if burstSetupApplied {
+            teardownBurstDeviceSetup()
+        }
+    }
+
+    /// バースト開始時のデバイス設定（sessionQueue上で1回だけ・撮影中は触らない＝-11830回避）。
+    /// torch常時点灯＋AE/WB/AFを.lockedで固定（既存値保持。setExposureModeCustomは-11800で不安定なため使わない）。
+    private func applyBurstDeviceSetup() {
+        guard let device = videoDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+
+            // 散発する再収束(50〜200ms)を抑えるため、現在値でロック。
+            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+            if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
+            if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+
+            if device.hasTorch, device.isTorchModeSupported(.on) {
+                do {
+                    try device.setTorchModeOn(level: Self.torchLevel)
+                    // 発熱スロットリング等で点かない場合の検出（"光ったつもりで光ってない"事故）。
+                    if !device.isTorchActive {
+                        print("[HAKKO] torch requested but not active (thermal throttling?)")
+                    }
+                } catch {
+                    print("[HAKKO] torch on failed: \(error)")
+                }
+            }
+            burstSetupApplied = true
+        } catch {
+            print("[HAKKO] burst device setup failed: \(error)")
+        }
+    }
+
+    /// バースト終了時の後始末（sessionQueue上）。torch消灯・AE/WB/AFを継続オートに戻す。成功時のみフラグを下ろす。
+    private func teardownBurstDeviceSetup() {
+        guard let device = videoDevice else { burstSetupApplied = false; return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.hasTorch, device.torchMode != .off { device.torchMode = .off }
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            burstSetupApplied = false
+        } catch {
+            print("[HAKKO] burst device teardown failed: \(error)")
         }
     }
 
@@ -143,12 +213,11 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    /// 次の1枚を撮る。撮影完了を待ってから次を撃つ直列（フラッシュの実サイクルが律速＝速さは追わない）。
-    /// sessionQueue上で呼ぶ。「1枚飛行中は次を出さない」で二重発火を防ぐ。
+    /// 次の1枚を撮る。撮影完了を待ってから次を撃つ直列。sessionQueue上で呼ぶ。maxBurstで自動的に撃ち切る。
     private func fireNextShotIfNeeded() {
         guard isBursting else { return }
         if burstCount >= Self.maxBurst {
-            isBursting = false // 撃ち切り（→この後Stage3の発光チャージへ繋げる）
+            endBurst() // 撃ち切り＋デバイス後始末（→この後Stage3の発光チャージへ繋げる）
             return
         }
         guard !shotInFlight else { return }
@@ -158,20 +227,20 @@ final class CameraController: NSObject, ObservableObject {
         inFlightGeneration = burstGeneration
 
         let settings = AVCapturePhotoSettings()
-        // 本物のフラッシュ（実光がシーンに当たる＝HAKKOの堀）。サポートするときのみ。
-        if photoOutput.supportedFlashModes.contains(.on) {
-            settings.flashMode = .on
+        // torch常時点灯なのでフラッシュはオフ（プリ測光ゼロ）。
+        if photoOutput.supportedFlashModes.contains(.off) {
+            settings.flashMode = .off
         }
         settings.photoQualityPrioritization = .speed
         if photoOutput.isVirtualDeviceFusionSupported {
             settings.isAutoVirtualDeviceFusionEnabled = false
         }
 
-        // 昇圧音プレースホルダ: コマ間の測光/充電待ちを"チャージ"として演出（本格合成はStage3）。
-        // ※.hapticContinuousは連写禁止（仕様書§3）。ここでは音の器だけ用意し、実音はStage3で。
+        // 昇圧音プレースホルダ: コマ間の待ちを"チャージ"として演出（本格合成はStage3）。
         haptics.startChargePlaceholder()
 
         inFlightFireTime = ProcessInfo.processInfo.systemUptime
+        inFlightWillCaptureTime = 0 // willCapture未着(エラー枚)を検出可能に（計測交差防止）
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 }
@@ -179,13 +248,15 @@ final class CameraController: NSObject, ObservableObject {
 // MARK: - AVCapturePhotoCaptureDelegate
 
 extension CameraController: AVCapturePhotoCaptureDelegate {
-    /// 露出が確定し実際にフラッシュが焚かれる瞬間。ここで触覚を鳴らす＝発光と触覚を厳密同期。
+    /// 露出が確定し実際に撮影される瞬間。ここで触覚を鳴らす＝発光と触覚を同期。
     func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.inFlightWillCaptureTime = ProcessInfo.processInfo.systemUptime
+            // 世代が変わった前バーストの残弾では触覚を鳴らさない（誤発火・二重発火の防止）。
+            guard self.isBursting, self.inFlightGeneration == self.burstGeneration else { return }
             self.haptics.stopChargePlaceholder()      // 充電演出を止め
-            self.haptics.playBurstTick()              // 実発光の瞬間に "ゴッ"（触覚）
+            self.haptics.playBurstTick()              // 撮影の瞬間に "ガシャッ"（触覚）
         }
     }
 
@@ -208,11 +279,16 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             guard let self else { return }
 
             let done = ProcessInfo.processInfo.systemUptime
-            let meterMs = (self.inFlightWillCaptureTime - self.inFlightFireTime) * 1000
-            let captureMs = (done - self.inFlightWillCaptureTime) * 1000
             let totalMs = (done - self.inFlightFireTime) * 1000
-            print(String(format: "[HAKKO][measure] flashFired=%@ meter=%.0fms capture=%.0fms total=%.0fms",
-                         flashFired ? "YES" : "no", meterMs, captureMs, totalMs))
+            if self.inFlightWillCaptureTime > 0 {
+                let meterMs = (self.inFlightWillCaptureTime - self.inFlightFireTime) * 1000
+                let captureMs = (done - self.inFlightWillCaptureTime) * 1000
+                print(String(format: "[HAKKO][measure] flashFired=%@ meter=%.0fms capture=%.0fms total=%.0fms",
+                             flashFired ? "YES" : "no", meterMs, captureMs, totalMs))
+            } else {
+                print(String(format: "[HAKKO][measure] flashFired=%@ (no willCapture) total=%.0fms",
+                             flashFired ? "YES" : "no", totalMs))
+            }
 
             let generation = self.inFlightGeneration
             self.shotInFlight = false

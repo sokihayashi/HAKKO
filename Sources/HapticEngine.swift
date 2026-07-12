@@ -13,6 +13,17 @@ final class HapticEngine {
     static var burstIntensity: Float = 0.9
     static var burstSharpness: Float = 0.8
 
+    /// シャッター質感パターン。当時のCCDコンパクトが"演出"したメカ感（＝物理シャッター風）を狙う。
+    /// singleTransient: 従来の単発（現代的な"コッ"）。
+    /// mechShutter: 先幕→後幕の2連衝撃で機械が動いた質感を作る（.hapticTransientの束ね・§3遵守。continuousは不使用）。
+    enum ShutterFeel { case singleTransient, mechShutter }
+    static var shutterFeel: ShutterFeel = .mechShutter
+    /// mechShutter の2発目までの間（秒）。物理シャッターの先幕→後幕の間合い。実機で詰める。
+    static var mechShutterGap: TimeInterval = 0.035
+    /// mechShutter 2発目の強さ・鋭さ（後幕は先幕よりやや弱く鈍い想定）。
+    static var mechSecondIntensity: Float = 0.7
+    static var mechSecondSharpness: Float = 0.55
+
     /// チャージ完了などの単発合図用（Stage 3で使用）。今は連写と同じ既定値。
     static var singleIntensity: Float = 1.0
     static var singleSharpness: Float = 0.7
@@ -27,8 +38,17 @@ final class HapticEngine {
 
     // 事前生成した連写用プレイヤー。makePlayerを撮影のたびに呼ぶ遅延を消し、触覚を最速で発火する。
     private var burstPlayer: CHHapticPatternPlayer?
-    private var burstPlayerIntensity: Float = .nan  // 生成時のパラメータ。変わったら作り直す。
-    private var burstPlayerSharpness: Float = .nan
+    private var burstPlayerSignature = ""  // 生成時のパラメータ署名。変わったら作り直す。
+
+    /// 現在の連写触覚パラメータの署名（質感・強さ・鋭さ・2連の間合いを含む）。変化検知に使う。
+    private static var burstSignature: String {
+        switch shutterFeel {
+        case .singleTransient:
+            return "single|\(burstIntensity)|\(burstSharpness)"
+        case .mechShutter:
+            return "mech|\(burstIntensity)|\(burstSharpness)|\(mechShutterGap)|\(mechSecondIntensity)|\(mechSecondSharpness)"
+        }
+    }
 
     /// queue: 呼び出し側(CameraController)のsessionQueueを渡す。全アクセスをこのキューに直列化する。
     init(queue: DispatchQueue) {
@@ -95,15 +115,46 @@ final class HapticEngine {
         }
     }
 
-    /// burstPlayerが未生成 or パラメータ変更済みなら作り直す（queue上で呼ぶ）。
+    /// burstPlayerが未生成 or パラメータ・質感変更済みなら作り直す（queue上で呼ぶ）。
     private func ensureBurstPlayer() {
-        if burstPlayer == nil
-            || burstPlayerIntensity != Self.burstIntensity
-            || burstPlayerSharpness != Self.burstSharpness {
-            burstPlayer = makeTransientPlayer(intensity: Self.burstIntensity, sharpness: Self.burstSharpness)
-            burstPlayerIntensity = Self.burstIntensity
-            burstPlayerSharpness = Self.burstSharpness
+        let sig = Self.burstSignature
+        if burstPlayer == nil || burstPlayerSignature != sig {
+            burstPlayer = makeBurstPlayer()
+            burstPlayerSignature = sig
         }
+    }
+
+    /// 現在のshutterFeelに応じた連写触覚プレイヤーを生成。
+    /// singleTransient: 単発。mechShutter: 先幕→(gap)→後幕 の2連衝撃（.hapticTransientの束ね・§3遵守）。
+    private func makeBurstPlayer() -> CHHapticPatternPlayer? {
+        guard let engine else { return nil }
+        var events: [CHHapticEvent] = [
+            transientEvent(intensity: Self.burstIntensity, sharpness: Self.burstSharpness, at: 0)
+        ]
+        if Self.shutterFeel == .mechShutter {
+            events.append(
+                transientEvent(intensity: Self.mechSecondIntensity, sharpness: Self.mechSecondSharpness, at: Self.mechShutterGap)
+            )
+        }
+        do {
+            let pattern = try CHHapticPattern(events: events, parameters: [])
+            return try engine.makePlayer(with: pattern)
+        } catch {
+            print("[HAKKO] failed to make burst player: \(error)")
+            return nil
+        }
+    }
+
+    /// `.hapticTransient` イベントを1つ作る（相対時刻付き）。持続振動は使わない（§3）。
+    private func transientEvent(intensity: Float, sharpness: Float, at relativeTime: TimeInterval) -> CHHapticEvent {
+        CHHapticEvent(
+            eventType: .hapticTransient,
+            parameters: [
+                CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+                CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
+            ],
+            relativeTime: relativeTime
+        )
     }
 
     /// 単発の合図（Stage 3のチャージ完了などで使用）。都度生成でよい（頻度が低い）。

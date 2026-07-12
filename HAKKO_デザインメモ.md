@@ -95,3 +95,20 @@
 
 ### 未確証(=宋其の創作領域/仕様書§5): 具体DR段数・CFA/カラーマトリクス(Fuji/Kodakの色)・光学欠陥の実数・JPEG/シャープの実数。研究は機序の骨、味は実機で。
 出典: darktable highlight-reconstruction, rawpedia White_Balance, adimec blooming-smear, IEEE 1156370。
+
+### 8.5 【確定】発光=torch常時点灯・操作=自動連射（実機A/B決着）
+速度モードの実機A/B(SpeedMode 4種)で決着。
+- **torch常時点灯＋flashMode=.off が圧勝**: meter=2〜5ms(実測)。写真フラッシュ.on(600〜1700ms)の100〜300倍速い。「Native感と変わらない遅さ」を解消。
+- flash locked(=.on+AEロック)も遅い(590〜1546ms)=プリ測光はロックで消えない(確定)。
+- **torch custom-exp(setExposureModeCustom)は-11800エラー(Code=-16800)で不安定→不採用**。露出は継続オートのまま、torchだけ点灯するtorch contが正解(シンプルが勝った)。
+- 散発する50〜200msの跳ねは継続AF/AE再収束。→ torch cont に AE/WB/AF の.locked(既存値保持・customは使わない)を併用して抑える。
+- 確定実装: torch常時点灯＋.off＋開始時1回だけlockForConfiguration(torch点灯+.lockedロック)＋撮影中は触らない(-11830回避)。ZSL/responsive/fastCapturePrioritizationも有効化(torch=.offなので効く)。実験モード(SpeedMode)は全削除。
+
+### 8.6 操作モデル: 一発トリガ自動連射
+- 指離しで連写を止める方式は連打/離し判定のバグ源(実機で-11830や計測交差が多発)。→ **1回押したら maxBurst まで自動連射**に変更。指は置きっぱなし(長押し)でもよいが、離しは連射に影響しない。
+- maxBurstは初期5→12に増やす(5は短い/動画素材数も兼ねる)。
+
+### 8.7 【将来・忘れないこと】連写を合体して動画化
+- 撮った連写バーストを1本の動画(GIF or mp4は未定)に合体するのが最終形。連写は動画のフレーム素材。
+- 現状は capturedImages 配列にメモリ保持しているだけ。Stage2でCCD処理→Stage後半で動画エンコード(AVAssetWriter等)。
+- torch常時点灯の連続フレームは「動く被写体の連続」を撮れるので動画化と相性が良い。フレーム間隔(テンポ)が一定であるほど動画が滑らか=torch方式の速さ・一定性が効く。
