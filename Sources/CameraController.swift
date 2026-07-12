@@ -7,8 +7,8 @@ import UIKit
 /// - torch(連続LED光)＋flashMode=.off。写真フラッシュ(.on)はプリフラッシュ測光が構造的に必須で600〜1700ms、
 ///   AEロックでも迂回不能。iPhoneのフラッシュもLED連続光で凍結効果は無くtorchと本質同じ。torch方式なら
 ///   プリ測光ゼロで meter=2〜5ms（実測）。torchは開始時に1回だけlockForConfigurationし撮影中は触らない＝-11830回避。
-/// - 散発する再収束(50〜200ms)を抑えるため、開始時に AE/WB/AF を .locked（既存値保持。setExposureModeCustomは
-///   -11800で不安定だったため使わない）。
+/// - 露出/WB/AFはロックしない。torch常時点灯下では継続オートのままで安定し、被写体変化にも追従（動画化前提）。
+///   実機で.lockedはバースト境界の再収束スパイクを生むだけで跳ねは消えなかったため撤去。
 /// - 触覚(.hapticTransient)は willCapturePhoto（＝実発光の瞬間）で鳴らして発光と同期。
 ///
 /// 操作モデル: 1回押したら maxBurst まで自動連射（指離しで止めない＝連打/離し判定のバグ源を排除）。
@@ -16,8 +16,8 @@ import UIKit
 final class CameraController: NSObject, ObservableObject {
     // MARK: - チューニング定数（宋其が調整）
 
-    /// 連写バーストの最大枚数。動画化の素材数も兼ねるので多め（初期12）。
-    static let maxBurst = 12
+    /// 連写バーストの最大枚数。動画化の素材数を兼ねつつ、torch発熱スロットル(実測でmeterスパイク)を避け8。
+    static let maxBurst = 8
     /// torchの明るさ（0.0–1.0 or maxAvailableTorchLevel）。発光の強さ。実機で詰める。
     static let torchLevel: Float = 1.0
 
@@ -160,48 +160,35 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     /// バースト開始時のデバイス設定（sessionQueue上で1回だけ・撮影中は触らない＝-11830回避）。
-    /// torch常時点灯＋AE/WB/AFを.lockedで固定（既存値保持。setExposureModeCustomは-11800で不安定なため使わない）。
+    /// torch常時点灯のみ。AE/WB/AFの.lockedは撤去した — 実機で locked↔continuousAuto の往復が
+    /// バースト境界に50〜130msの再収束スパイクを生み、しかもロックしても跳ねは残った（効果薄・副作用大）。
+    /// torch常時点灯下では継続オートのままでも露出は安定し、被写体変化への追従も保てる（動画化前提）。
     private func applyBurstDeviceSetup() {
-        guard let device = videoDevice else { return }
+        guard let device = videoDevice, device.hasTorch, device.isTorchModeSupported(.on) else { return }
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
-
-            // 散発する再収束(50〜200ms)を抑えるため、現在値でロック。
-            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
-            if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
-            if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
-
-            if device.hasTorch, device.isTorchModeSupported(.on) {
-                do {
-                    try device.setTorchModeOn(level: Self.torchLevel)
-                    // 発熱スロットリング等で点かない場合の検出（"光ったつもりで光ってない"事故）。
-                    if !device.isTorchActive {
-                        print("[HAKKO] torch requested but not active (thermal throttling?)")
-                    }
-                } catch {
-                    print("[HAKKO] torch on failed: \(error)")
-                }
+            try device.setTorchModeOn(level: Self.torchLevel)
+            // 発熱スロットリング等で点かない場合の検出（"光ったつもりで光ってない"事故）。
+            if !device.isTorchActive {
+                print("[HAKKO] torch requested but not active (thermal throttling?)")
             }
             burstSetupApplied = true
         } catch {
-            print("[HAKKO] burst device setup failed: \(error)")
+            print("[HAKKO] burst torch on failed: \(error)")
         }
     }
 
-    /// バースト終了時の後始末（sessionQueue上）。torch消灯・AE/WB/AFを継続オートに戻す。成功時のみフラグを下ろす。
+    /// バースト終了時の後始末（sessionQueue上）。torch消灯のみ。成功時のみフラグを下ろす。
     private func teardownBurstDeviceSetup() {
         guard let device = videoDevice else { burstSetupApplied = false; return }
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             if device.hasTorch, device.torchMode != .off { device.torchMode = .off }
-            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
             burstSetupApplied = false
         } catch {
-            print("[HAKKO] burst device teardown failed: \(error)")
+            print("[HAKKO] burst torch off failed: \(error)")
         }
     }
 
