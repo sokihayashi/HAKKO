@@ -19,13 +19,31 @@ import UIKit
 enum ExposureMode: CaseIterable {
     /// 継続オート＋ZSL有効（現状）。被写体変化に追従するがtorch由来のAE再測光スパイクが出る。
     case autoZSL
-    /// 露出/ISO/WB/AFをバースト間も完全固定（setExposureModeCustom）。スパイクを消す。ZSLは無効化。
+    /// 速SS固定＋ISO補正＋AF/WB固定（setExposureModeCustom）。AE再測光スパイクを消し、ブレも止める。ZSLは無効化。
     case customLocked
 
     var label: String {
         switch self {
         case .autoZSL: return "EXP: auto+ZSL"
-        case .customLocked: return "EXP: custom-locked"
+        case .customLocked: return "EXP: fast-SS locked"
+        }
+    }
+}
+
+/// AF中の"ピントが動く"演出のA/B（デバッグ・実機で見比べて1本化する）。customLockedのフォーカス"間"に効く。
+enum FocusFeel: CaseIterable {
+    /// 山型: 被せ層のボケ量を 0→強→0 で動かす（ぶけて→スッと晴れる）。UI演出のみ・実映像は触らない。
+    case bumpBlur
+    /// オーバーシュート: 被せ層のボケを 強→行き過ぎ→合焦 で動かす（フォーカスサーチ風）。UI演出のみ。
+    case overshootBlur
+    /// レンズ実駆動: 実際にAFを手前→目標へ動かし実映像をボカす（最も本物）。被せ層は使わない。
+    case realLensSweep
+
+    var label: String {
+        switch self {
+        case .bumpBlur: return "AF: bump"
+        case .overshootBlur: return "AF: overshoot"
+        case .realLensSweep: return "AF: real-lens"
         }
     }
 }
@@ -38,39 +56,83 @@ final class CameraController: NSObject, ObservableObject {
     /// torchの明るさ（0.0–1.0）。発光の強さ。実機で詰める。
     static let torchLevel: Float = 1.0
 
+    /// customLockedの目標シャッター速度（秒）。被写体を"凍らせる"ため速く固定する。
+    /// ※HAKKOはtorch=連続光なので、動きを止める仕事は100%シャッター速度が担う（キセノンと違い発光では止まらない）。
+    ///   1/120は"動かない前提"のSSで、動く被写体・動かしながら撮るとブレて"凍ったストロボ感"が出ない → 1/500へ。
+    /// 短いほどブレは止まるが暗くなり、そのぶんISOで補正＝ノイズが増える（CCD狙いなのでノイズは歓迎/§14）。
+    /// ※トーチは暗いので速すぎると最大ISOでも暗くなる（ISO saturatedログで検出）。速さ⇄明るさの最終値は実機で宋其が詰める。
+    ///   実機では 1/250〜1/1000 を振って凍りと明るさの両立点を探す。
+    static let targetShutter: TimeInterval = 1.0 / 500.0
+
+    /// customLockedのレンズ位置（0.0=最至近 / 1.0=無限遠）。遠め固定でパンフォーカス＝ほぼ全体にピン。
+    /// F値はiPhone固定（絞れない）ので、被写界深度は「遠めに置いて手前〜無限遠を許容内に入れる」で作る。
+    /// CCDコンパクトの深い被写界深度（§2）に合わせる。実機で詰める。
+    /// ※0.85(無限遠寄り)は近〜中距離の被写体でピンが甘く見えた(実機確認)→0.5(中距離)へ。
+    ///   lensPositionは実距離と非線形(機種依存)。近すぎ/遠すぎで手前が外れるので中間から詰める。
+    static let lensPosition: Float = 0.5
+
+    /// torch点灯直後にAEがtorch光へ馴染むのを待つ秒数（W-2対策・sessionQueue上でasyncAfter）。
+    /// torch前(暗い)のAE値でcustom固定すると1枚目が露出オーバー→点灯後この時間だけ継続オートで測らせてから固定する。
+    /// 長いほど確実だが起動が鈍る。実機で1枚目の露出/明るさ揃いを見て詰める。
+    static let aeSettleDelay: TimeInterval = 0.12
+
+    /// AF演出(bump/overshoot)の被せ層ボケ最大opacity（0〜1）。強いほど濃く曇る。実機で詰める。
+    static let focusBlurMax: Double = 0.55
+    /// realLensSweepでレンズを最初に飛ばす位置（手前=近距離側に振ってからlensPositionへ戻す＝サーチ感）。
+    /// これがlensPositionと差があるほど実映像のボケが大きい。0.0=最至近。実機で詰める。
+    static let focusSweepStart: Float = 0.0
+
     /// 露出モード（デバッグA/B）。UIから循環切替。
     @Published var exposureMode: ExposureMode = .autoZSL
 
     let session = AVCaptureSession()
-    private let sessionQueue = DispatchQueue(label: "com.sokihayashi.HAKKO.sessionQueue")
-    private let photoOutput = AVCapturePhotoOutput()
+    // 以下、デバイス制御は CameraController+Device.swift（同一モジュールのextension）から触るため internal。
+    // モジュール外へは公開されない（外部はSwiftのモジュール境界で遮断）。
+    let sessionQueue = DispatchQueue(label: "com.sokihayashi.HAKKO.sessionQueue")
+    let photoOutput = AVCapturePhotoOutput()
     /// 触覚エンジンはsessionQueueを共有して全アクセスを直列化する（CoreHapticsハンドラとのデータレース回避）。
     private lazy var haptics = HapticEngine(queue: sessionQueue)
     private var isConfigured = false
     /// torch/ロック操作のため撮影デバイスを保持（sessionQueue上で触る）。
-    private var videoDevice: AVCaptureDevice?
+    var videoDevice: AVCaptureDevice?
     /// バースト用のデバイス設定(torch/ロック)を適用したか。teardown成功時のみ下ろす（後始末取りこぼし防止）。
-    private var burstSetupApplied = false
+    var burstSetupApplied = false
     /// バースト開始時にexposureModeを固定（途中でモードが変わっても現バーストは一貫）。
-    private var activeExposureMode: ExposureMode = .autoZSL
+    var activeExposureMode: ExposureMode = .autoZSL
 
-    /// 撮影済み画像（メモリ保持のみ）。UIへはsessionQueue上の内部配列のスナップショットを反映する。
-    @Published private(set) var capturedImages: [UIImage] = []
+    /// 撮影済みショット（画像＋ピント判定メタ・メモリ保持のみ）。UIへはsessionQueue上の内部配列のスナップショットを反映する。
+    @Published private(set) var capturedShots: [CapturedShot] = []
+
+    /// AF中の被せ層ボケ量（0=クリア / 1=最大ボケ・UI用・main更新）。bump/overshootで時間駆動する。
+    /// ContentViewがこれをプレビュー上の"すりガラス"層のopacityに反映＝AF中のボケを可視化（実際にAF処理中なので嘘でない）。
+    /// realLensSweepは実映像をボカすので被せ層は使わず、この値は0のまま。
+    @Published private(set) var focusBlur: Double = 0
+
+    /// AF演出モード（デバッグA/B）。UIから循環切替。
+    @Published var focusFeel: FocusFeel = .bumpBlur
+
+    /// bump/overshootの被せ層ボケを刻むタイマー（main上でのみ触る）。
+    private var focusBlurTimer: Timer?
+
+    /// AFロックの目標レンズ位置（=段①で読んだオートの現位置）。realLensSweepが段②で戻す先。sessionQueue上。
+    var focusLockTarget: Float = 0.5
+
+    /// バースト押下時刻（timingログ用・押下→初撮影の総経過を出す）。sessionQueue上。
+    private var burstPressTime: TimeInterval = 0
 
     // 連写状態（sessionQueue上でのみ触る）
-    private var isBursting = false
+    var isBursting = false
     private var burstCount = 0
     private var shotInFlight = false
     /// バースト世代。開始のたびにインクリメントし、遅れて着弾した前バーストの完了を弾く。
-    private var burstGeneration = 0
+    var burstGeneration = 0
     /// 現在飛行中の1枚を発火したときの世代。
     private var inFlightGeneration = 0
     /// sessionQueue上でのみ触る実体。mainへはこれをスナップショットして流す（main.async順序非保証を回避）。
-    private var images: [UIImage] = []
+    private var shots: [CapturedShot] = []
 
-    // デバッグ計測: 撮影発火→露出確定 と 露出確定→処理完了 の内訳。
-    private var inFlightFireTime: TimeInterval = 0
-    private var inFlightWillCaptureTime: TimeInterval = 0
+    /// デバッグ計測（撮影発火→露出確定→処理完了の内訳）。A/B決着後はBurstMeasurementごと削除可。
+    private var measurement = BurstMeasurement()
 
     // MARK: - ライフサイクル
 
@@ -94,26 +156,19 @@ final class CameraController: NSObject, ObservableObject {
     func stop() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            // session停止で torch/custom露出/ZSL は物理的にリセットされる。stop経路では beginConfiguration を
-            // 伴うteardown（ZSL再有効化）を走らせず、torch消灯だけ軽く行ってから停止する（構成変更の交差回避）。
-            self.turnTorchOffOnly()
             self.isBursting = false
+            self.endFocusVisual()          // フォーカス中に停止したらボケを残さない
             self.shotInFlight = false      // session停止で飛行中delegateが来ない可能性に備え自己完結
-            self.burstSetupApplied = false // session停止でデバイス状態はリセットされる。フラグも揃える。
+            // デバイスは同一インスタンスを保持し再start時も再構成されない（isConfiguredガード）。
+            // よってstopRunningではcustom露出/WB/AFロック/ZSL無効は自動で戻らない → 停止"前"に明示復元する。
+            // （teardownはbeginConfigurationを伴うが、stopRunningの前なら構成変更は交差しない）
+            if self.burstSetupApplied {
+                self.teardownBurstDeviceSetup()
+            } else {
+                self.turnTorchOffOnly() // 設定未適用ならtorch消灯だけで足りる
+            }
             guard self.session.isRunning else { return }
             self.session.stopRunning()
-        }
-    }
-
-    /// torchだけ消す（stop経路用・session構成変更を伴わない軽い後始末）。sessionQueue上。
-    private func turnTorchOffOnly() {
-        guard let device = videoDevice, device.hasTorch, device.torchMode != .off else { return }
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            device.torchMode = .off
-        } catch {
-            print("[HAKKO] stop torch off failed: \(error)")
         }
     }
 
@@ -166,19 +221,6 @@ final class CameraController: NSObject, ObservableObject {
         return true
     }
 
-    /// ZSL/responsiveCapture/fastCapturePrioritizationの有効/無効を切り替える（session構成変更・iOS17+）。
-    /// custom露出はZSLと排他なので、customLockedバースト時は無効化する。依存: responsiveはZSL必須、fastはresponsive必須。
-    private func applyZSL(enabled: Bool) {
-        guard #available(iOS 17.0, *) else { return }
-        if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = enabled }
-        if photoOutput.isResponsiveCaptureSupported {
-            photoOutput.isResponsiveCaptureEnabled = enabled && photoOutput.isZeroShutterLagEnabled
-        }
-        if photoOutput.isFastCapturePrioritizationSupported {
-            photoOutput.isFastCapturePrioritizationEnabled = enabled && photoOutput.isResponsiveCaptureEnabled
-        }
-    }
-
     // MARK: - 連写バースト（torch常時点灯・自動連射・仕様書 §2・§3・§4）
 
     /// 露出モードを循環切替（デバッグA/B）。UI(main)から呼ぶ。
@@ -188,111 +230,108 @@ final class CameraController: NSObject, ObservableObject {
         exposureMode = all[(idx + 1) % all.count]
     }
 
+    /// AF演出モードを循環切替（デバッグA/B・bump/overshoot/real-lens）。UI(main)から呼ぶ。
+    func cycleFocusFeel() {
+        let all = FocusFeel.allCases
+        guard let idx = all.firstIndex(of: focusFeel) else { return }
+        focusFeel = all[(idx + 1) % all.count]
+    }
+
     /// シャッターを押したら maxBurst まで自動連射（指離しでは止めない）。UI(main)からexposureModeを読む。
     func startBurst() {
         let mode = exposureMode
         sessionQueue.async { [weak self] in
             guard let self, self.isConfigured, !self.isBursting else { return }
+            self.burstPressTime = ProcessInfo.processInfo.systemUptime // timing: 押下起点
             self.burstGeneration &+= 1        // 世代を進める（遅れて着弾する前バースト完了を弾く）
             self.isBursting = true
             self.burstCount = 0
             self.shotInFlight = false
             self.activeExposureMode = mode     // 現バーストのモードを固定
-            self.images.removeAll()
-            self.publishImages()
+            self.shots.removeAll()
+            self.publishShots()
             self.haptics.prewarmBurstPlayer() // 触覚をwillCaptureで即発火できるよう先に用意
-            self.applyBurstDeviceSetup()      // torch点灯 + (customLockedなら)露出固定（開始時1回・撮影中は触らない）
-            self.fireNextShotIfNeeded()
+            // customLockedはAF固定＋AE安定待ち(aeSettleDelay)の"間"がある。その間をフォーカス演出(微弱パルス=
+            // レンズ駆動の感覚)で埋め、押下→1枚目のラグを「無反応」でなく「ピント合わせ中」に変える（デザインメモ§12）。
+            // autoZSLは即発火で待ちが無いのでフォーカス演出は鳴らさない。
+            // customLockedはAF固定＋AE安定待ち(aeSettleDelay)の"間"がある。その間を「ピント合わせ中」に翻訳する。
+            // 触覚(レンズ駆動パルス)は全AF演出で共通。視覚はfocusFeelで分岐（bump/overshoot=被せ層 / real=実映像）。
+            if mode == .customLocked {
+                self.haptics.playFocusRamp()
+                self.startFocusVisual() // bump/overshootは被せ層を時間駆動。realは実映像なので被せ層は動かさない。
+            }
+            // torch点灯 +（customLockedなら）露出/AF固定を投げ、"確定"してから1枚目を撮る。
+            // これで各バースト1枚目のAF再収束/露出未確定の跨ねを消し、全枚を同一露出＝明るさ均一にする（W-2も解消）。
+            let generation = self.burstGeneration
+            self.applyBurstDeviceSetup { [weak self] in
+                guard let self else { return }
+                self.endFocusVisual() // 露出確定＝合焦したのでボケをクリア（この直後に1枚目発光）
+                // 確定を待つ間に次のバーストが来た/停止した場合は、この古い確定では撮らない。
+                guard self.isBursting, self.burstGeneration == generation else { return }
+                self.fireNextShotIfNeeded()
+            }
         }
     }
 
     /// バーストを終了状態にしてデバイス設定を後始末する（撃ち切り/stopの経路から・冪等）。
     private func endBurst() {
         isBursting = false
+        endFocusVisual() // フォーカス中に撃ち切り/停止したらボケを残さない
         if burstSetupApplied {
             teardownBurstDeviceSetup()
         }
     }
 
-    /// バースト開始時のデバイス設定（sessionQueue上で1回だけ・撮影中は触らない＝-11830回避）。
-    /// torch点灯は両モード共通。customLockedのみ露出/ISO/WB/AFを固定してAE再測光のmeterスパイクを消す。
-    /// ※setTorchModeOn直後のisTorchActiveチェックは点灯のハード非同期遅延で誤検出するため行わない
-    ///   （リサーチ確定・真の失敗はthrowで捕まる）。
-    private func applyBurstDeviceSetup() {
-        guard let device = videoDevice, device.hasTorch, device.isTorchModeSupported(.on) else { return }
-
-        // customLockedはZSL(custom露出と排他)を無効化してから固定する。session構成変更はlockとは別経路。
-        if activeExposureMode == .customLocked {
-            session.beginConfiguration()
-            applyZSL(enabled: false)
-            session.commitConfiguration()
-        }
-
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            try device.setTorchModeOn(level: Self.torchLevel)
-
-            if activeExposureMode == .customLocked {
-                // WB/AFを先に固定（露出のcompletion待ちの間も変動させない）。
-                if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
-                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
-                // 露出を現在値でcustom固定。activeFormatの範囲にクランプ（範囲外は-11800/例外の主因）。
-                if device.isExposureModeSupported(.custom) {
-                    let fmt = device.activeFormat
-                    let dur = clampTime(device.exposureDuration, fmt.minExposureDuration, fmt.maxExposureDuration)
-                    let iso = min(max(device.iso, fmt.minISO), fmt.maxISO)
-                    device.setExposureModeCustom(duration: dur, iso: iso, completionHandler: nil)
-                } else {
-                    print("[HAKKO] custom exposure not supported; falling back to auto")
-                }
-            }
-            burstSetupApplied = true
-        } catch {
-            print("[HAKKO] burst device setup failed: \(error)")
-        }
-    }
-
-    /// バースト終了時の後始末（sessionQueue上）。torch消灯＋(customLockedなら)露出/WB/AFを継続オートへ戻す。
-    /// 成功時のみフラグを下ろす。custom無効化したZSLも再有効化。
-    private func teardownBurstDeviceSetup() {
-        guard let device = videoDevice else { burstSetupApplied = false; return }
-        let wasCustom = activeExposureMode == .customLocked
-        var restored = false
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            if device.hasTorch, device.torchMode != .off { device.torchMode = .off }
-            if wasCustom {
-                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-                if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-            }
-            restored = true
-            burstSetupApplied = false
-        } catch {
-            print("[HAKKO] burst device teardown failed: \(error)") // フラグは下ろさず次回再試行
-        }
-        // ZSL再有効化はexposure復帰が成功した場合のみ。失敗時はcustom露出が残っており、ZSLと排他違反になる。
-        if wasCustom && restored {
-            session.beginConfiguration()
-            applyZSL(enabled: true)
-            session.commitConfiguration()
-        }
-    }
-
-    /// CMTimeを[lo, hi]にクランプ（露出時間をactiveFormatの範囲に収める）。
-    private func clampTime(_ v: CMTime, _ lo: CMTime, _ hi: CMTime) -> CMTime {
-        if CMTimeCompare(v, lo) < 0 { return lo }
-        if CMTimeCompare(v, hi) > 0 { return hi }
-        return v
-    }
-
     /// 内部配列のスナップショットをmainの@Publishedへ反映（sessionQueue上で呼ぶ）。
-    private func publishImages() {
-        let snapshot = images
+    private func publishShots() {
+        let snapshot = shots
         DispatchQueue.main.async { [weak self] in
-            self?.capturedImages = snapshot
+            self?.capturedShots = snapshot
+        }
+    }
+
+    /// フォーカス視覚演出を開始（sessionQueue上から呼ぶ→main駆動）。
+    /// bump/overshootは被せ層ボケ量(focusBlur)をaeSettleDelayの間キーフレーム駆動。realは実映像がボケるので被せ層は動かさない。
+    private func startFocusVisual() {
+        let feel = focusFeel
+        guard feel != .realLensSweep else { return } // 実レンズ駆動はapplyBurstDeviceSetup側で実映像をボカす
+        DispatchQueue.main.async { [weak self] in
+            self?.driveFocusBlur(feel: feel)
+        }
+    }
+
+    /// フォーカス視覚演出を終了（合焦・停止時）。ボケを0へ。main駆動。
+    private func endFocusVisual() {
+        DispatchQueue.main.async { [weak self] in
+            self?.focusBlurTimer?.invalidate()
+            self?.focusBlurTimer = nil
+            self?.focusBlur = 0
+        }
+    }
+
+    /// 被せ層ボケ量を時間で動かす（main上・Timerで刻む）。bump=0→強→0、overshoot=強→抜け→戻る。
+    private func driveFocusBlur(feel: FocusFeel) {
+        focusBlurTimer?.invalidate()
+        let total = CameraController.aeSettleDelay
+        let step: TimeInterval = 0.016 // ≈60fps
+        let start = ProcessInfo.processInfo.systemUptime
+        let maxBlur = CameraController.focusBlurMax
+        focusBlurTimer = Timer.scheduledTimer(withTimeInterval: step, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let t = min(1.0, (ProcessInfo.processInfo.systemUptime - start) / total) // 0→1の進捗
+            switch feel {
+            case .bumpBlur:
+                // 山型: sin(π·t) で 0→1→0。合焦点に向かってスッと晴れる。
+                self.focusBlur = maxBlur * sin(Double.pi * t)
+            case .overshootBlur:
+                // 強→行き過ぎ(一瞬抜ける)→少し戻る→合焦。フォーカスサーチ風の揺り戻し。
+                let searched = 1.0 - t                        // 強→0のベース
+                let wobble = 0.35 * sin(Double.pi * 3 * t)    // 途中で揺らす
+                self.focusBlur = max(0, maxBlur * (searched + wobble * (1 - t)))
+            case .realLensSweep:
+                break
+            }
+            if t >= 1.0 { self.focusBlur = 0; timer.invalidate(); self.focusBlurTimer = nil }
         }
     }
 
@@ -308,6 +347,11 @@ final class CameraController: NSObject, ObservableObject {
         burstCount += 1
         shotInFlight = true
         inFlightGeneration = burstGeneration
+        if burstCount == 1 {
+            // timing: 押下→初撮影の総経過。ここまでにtorch点灯/レンズ駆動/露出確定が入る＝ガタつきの内訳を上のログと突合。
+            print(String(format: "[HAKKO][timing] first shot fired @+%.0fms after press",
+                         (ProcessInfo.processInfo.systemUptime - burstPressTime) * 1000))
+        }
 
         let settings = AVCapturePhotoSettings()
         // torch常時点灯なのでフラッシュはオフ（プリ測光ゼロ）。
@@ -322,8 +366,7 @@ final class CameraController: NSObject, ObservableObject {
         // 昇圧音プレースホルダ: コマ間の待ちを"チャージ"として演出（本格合成はStage3）。
         haptics.startChargePlaceholder()
 
-        inFlightFireTime = ProcessInfo.processInfo.systemUptime
-        inFlightWillCaptureTime = 0 // willCapture未着(エラー枚)を検出可能に（計測交差防止）
+        measurement.markFire(now: ProcessInfo.processInfo.systemUptime)
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 }
@@ -335,7 +378,7 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            self.inFlightWillCaptureTime = ProcessInfo.processInfo.systemUptime
+            self.measurement.markWillCapture(now: ProcessInfo.processInfo.systemUptime)
             // 世代が変わった前バーストの残弾では触覚を鳴らさない（誤発火・二重発火の防止）。
             guard self.isBursting, self.inFlightGeneration == self.burstGeneration else { return }
             self.haptics.stopChargePlaceholder()      // 充電演出を止め
@@ -346,14 +389,22 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
-        let flashFired = photo.resolvedSettings.isFlashEnabled
-
-        // 画像データの生成（重い処理）はコールバックスレッドで。状態更新はsessionQueueに直列化する。
-        var image: UIImage?
+        // 画像データの生成＋ピント判定（重い処理）はコールバックスレッドで。状態更新はsessionQueueに直列化する。
+        // lensPositionは撮影時に固定した値（customLockedのみ・autoでは追従するので記録しない）。
+        let appliedLens: Float? = activeExposureMode == .customLocked ? Self.lensPosition : nil
+        var shot: CapturedShot?
         if let error {
             print("[HAKKO] capture error: \(error)")
         } else if let data = photo.fileDataRepresentation(), let decoded = UIImage(data: data) {
-            image = decoded
+            // EXIFからISO/実効SSを拾う（ピント判定のメタ表示用）。取れなければ nil。
+            let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]
+            let iso = (exif?[kCGImagePropertyExifISOSpeedRatings as String] as? [Int])?.first
+            let expSec = exif?[kCGImagePropertyExifExposureTime as String] as? Double
+            let shutterDen = (expSec.map { $0 > 0 ? Int((1.0 / $0).rounded()) : nil }) ?? nil
+            // 中央領域のラプラシアン分散＝ピントスコア（完全ローカル計算）。
+            let sharp = Sharpness.varianceOfLaplacian(decoded)
+            shot = CapturedShot(image: decoded, sharpness: sharp, iso: iso,
+                                shutterDenominator: shutterDen, lensPosition: appliedLens)
         } else {
             print("[HAKKO] failed to build UIImage from photo")
         }
@@ -361,25 +412,16 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
         sessionQueue.async { [weak self] in
             guard let self else { return }
 
-            let done = ProcessInfo.processInfo.systemUptime
-            let totalMs = (done - self.inFlightFireTime) * 1000
-            if self.inFlightWillCaptureTime > 0 {
-                let meterMs = (self.inFlightWillCaptureTime - self.inFlightFireTime) * 1000
-                let captureMs = (done - self.inFlightWillCaptureTime) * 1000
-                print(String(format: "[HAKKO][measure] mode=%@ meter=%.0fms capture=%.0fms total=%.0fms",
-                             self.activeExposureMode.label, meterMs, captureMs, totalMs))
-            } else {
-                print(String(format: "[HAKKO][measure] mode=%@ (no willCapture) total=%.0fms",
-                             self.activeExposureMode.label, totalMs))
-            }
+            self.measurement.log(now: ProcessInfo.processInfo.systemUptime,
+                                 modeLabel: self.activeExposureMode.label)
 
             let generation = self.inFlightGeneration
             self.shotInFlight = false
             self.haptics.stopChargePlaceholder() // 念のため（エラー時にwillCaptureが来ないケース）
             // 遅れて着弾した前バーストの1枚は、世代が変わっていれば取り込まない（混入防止）。
-            if generation == self.burstGeneration, let image {
-                self.images.append(image)
-                self.publishImages()
+            if generation == self.burstGeneration, let shot {
+                self.shots.append(shot)
+                self.publishShots()
             }
             self.fireNextShotIfNeeded()
         }

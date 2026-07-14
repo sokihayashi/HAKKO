@@ -28,6 +28,16 @@ final class HapticEngine {
     static var singleIntensity: Float = 1.0
     static var singleSharpness: Float = 0.7
 
+    /// フォーカス演出のパルス列（.hapticTransientの微弱連打・§3遵守）。
+    /// バースト開始時のAF固定＋AE安定待ち(aeSettleDelay)の"間"を「レンズが動いてピントを合わせている」感覚に翻訳する。
+    /// これは充電ではなくフォーカス（当時コンデジのレンズ駆動の間）＝実在する処理の解（デザインメモ§12: 偽の演出は作らない）。
+    /// 弱く細かいパルスで"ジー/ウィーン"のニュアンスを出す。強すぎると発光のガシャッと競合するので控えめに。実機で詰める。
+    static var focusPulseIntensity: Float = 0.3
+    static var focusPulseSharpness: Float = 0.35
+    /// パルス間隔（秒）と本数。合計がaeSettleDelay(0.12s)に収まる範囲で。細かいほど連続的な駆動感。
+    static var focusPulseInterval: TimeInterval = 0.02
+    static var focusPulseCount: Int = 5
+
     private var engine: CHHapticEngine?
     private let supportsHaptics: Bool
     /// 全プロパティアクセスを直列化するキュー。CameraControllerのsessionQueueを共有し、
@@ -163,6 +173,24 @@ final class HapticEngine {
         ensureRunning()
         guard let player = makeTransientPlayer(intensity: Self.singleIntensity, sharpness: Self.singleSharpness) else { return }
         try? player.start(atTime: CHHapticTimeImmediate)
+    }
+
+    /// フォーカス演出: 微弱な.hapticTransientを等間隔で数発鳴らす（レンズ駆動の"間"を手に伝える・§3遵守）。
+    /// バースト開始の押下直後に1回呼ぶ。パターン1つに全パルスを並べて再生（連打の遅延を挟まない）。queue上で呼ぶ前提。
+    func playFocusRamp() {
+        guard let engine else { return } // 非対応機は無音
+        ensureRunning()
+        let events = (0..<max(1, Self.focusPulseCount)).map { i in
+            transientEvent(intensity: Self.focusPulseIntensity, sharpness: Self.focusPulseSharpness,
+                           at: Double(i) * Self.focusPulseInterval)
+        }
+        do {
+            let pattern = try CHHapticPattern(events: events, parameters: [])
+            let player = try engine.makePlayer(with: pattern)
+            try player.start(atTime: CHHapticTimeImmediate)
+        } catch {
+            print("[HAKKO] focus ramp haptic failed: \(error)") // 演出なので欠落は無視（撮影は続行）
+        }
     }
 
     // MARK: - 充電演出プレースホルダ（コマ間の測光/充電待ちを埋める）
